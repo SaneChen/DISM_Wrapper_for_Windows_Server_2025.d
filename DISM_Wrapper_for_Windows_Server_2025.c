@@ -12,13 +12,13 @@
  *   2. Copy this wrapper as C:\Windows\System32\dism.exe
  *
  * Author: System Administrator
- * Version: 2.1
+ * Version: 3.0
  * License: MIT
  *
- * New features in v2.1:
- *   - Modified replacement features to only use 2 modern features
- *   - Intercepts output of dism /online /english /get-features
- *   - Replaces "IIS-ManagementScriptingTools" with "IIS-LegacySnapIn" in output
+ * New features in v3.0:
+ *   - Reliable output processing for Citrix compatibility
+ *   - Preserves exact DISM output format
+ *   - Returns correct exit codes
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -57,7 +57,7 @@ static const char* REPLACEMENT_FEATURES[] = {
 #define MAX_CMD_LENGTH 32767
 
 /* Buffer size for reading process output */
-#define OUTPUT_BUFFER_SIZE 16384
+#define OUTPUT_BUFFER_SIZE 65536
 
 /* ============================================================================
  * Utility Functions
@@ -234,10 +234,6 @@ static bool is_get_features_command(int argc, char* argv[])
     return has_online && has_english && has_get_features;
 }
 
-/* ============================================================================
- * Output Processing Functions
- * ============================================================================ */
-
 /**
  * Simple string replacement function.
  *
@@ -289,35 +285,6 @@ static char* string_replace(const char* src, const char* old_str, const char* ne
 
     *dest = '\0';
     return result;
-}
-
-/**
- * Process output chunk to replace feature names.
- *
- * @param chunk The output chunk to process.
- * @param chunk_size Size of chunk.
- * @return Processed chunk (caller must free), or NULL on error.
- */
-static char* process_output_chunk(const char* chunk, size_t chunk_size)
-{
-    if (chunk == NULL || chunk_size == 0) {
-        return NULL;
-    }
-
-    /* Create null-terminated copy of chunk */
-    char* chunk_copy = (char*)malloc(chunk_size + 1);
-    if (chunk_copy == NULL) {
-        return NULL;
-    }
-
-    memcpy(chunk_copy, chunk, chunk_size);
-    chunk_copy[chunk_size] = '\0';
-
-    /* Replace feature name */
-    char* processed = string_replace(chunk_copy, OLD_FEATURE_NAME, NEW_FEATURE_NAME);
-
-    free(chunk_copy);
-    return processed;
 }
 
 /* ============================================================================
@@ -437,7 +404,142 @@ static bool build_passthrough_command_line(int argc, char* argv[],
  * ============================================================================ */
 
 /**
- * Execute DISM command with output interception for get-features command.
+ * Execute DISM command and capture output.
+ *
+ * @param command_line Full command line to execute.
+ * @param output_buffer Buffer to store output.
+ * @param buffer_size Size of buffer.
+ * @param exit_code Pointer to store process exit code.
+ * @return true if successful, false on error.
+ */
+static bool execute_and_capture_output(const char* command_line,
+                                     char* output_buffer,
+                                     size_t buffer_size,
+                                     int* exit_code)
+{
+    if (command_line == NULL || output_buffer == NULL || buffer_size == 0) {
+        return false;
+    }
+
+    SECURITY_ATTRIBUTES security_attrs;
+    STARTUPINFO startup_info;
+    PROCESS_INFORMATION process_info;
+
+    HANDLE stdout_read = NULL;
+    HANDLE stdout_write = NULL;
+
+    /* Initialize security attributes */
+    ZeroMemory(&security_attrs, sizeof(security_attrs));
+    security_attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
+    security_attrs.bInheritHandle = TRUE;
+    security_attrs.lpSecurityDescriptor = NULL;
+
+    /* Create pipe for stdout */
+    if (!CreatePipe(&stdout_read, &stdout_write, &security_attrs, 0)) {
+        return false;
+    }
+
+    /* Ensure read handle is not inherited */
+    SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+
+    /* Initialize startup info */
+    ZeroMemory(&startup_info, sizeof(startup_info));
+    startup_info.cb = sizeof(startup_info);
+    startup_info.dwFlags = STARTF_USESTDHANDLES;
+    startup_info.hStdOutput = stdout_write;
+    startup_info.hStdError = stdout_write;
+    startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    /* Initialize process info */
+    ZeroMemory(&process_info, sizeof(process_info));
+
+    /* Create mutable command line */
+    char* mutable_cmdline = _strdup(command_line);
+    if (mutable_cmdline == NULL) {
+        CloseHandle(stdout_read);
+        CloseHandle(stdout_write);
+        return false;
+    }
+
+    /* Create process */
+    BOOL success = CreateProcess(
+        NULL,
+        mutable_cmdline,
+        NULL,
+        NULL,
+        TRUE,
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        &startup_info,
+        &process_info
+    );
+
+    free(mutable_cmdline);
+    CloseHandle(stdout_write);
+
+    if (!success) {
+        CloseHandle(stdout_read);
+        return false;
+    }
+
+    /* Read output */
+    DWORD bytes_read = 0;
+    DWORD total_bytes = 0;
+    BOOL read_result = FALSE;
+    char temp_buffer[4096];
+
+    /* Clear output buffer */
+    output_buffer[0] = '\0';
+
+    /* Read all output */
+    while (1) {
+        read_result = ReadFile(stdout_read, temp_buffer,
+                             sizeof(temp_buffer) - 1, &bytes_read, NULL);
+
+        if (!read_result || bytes_read == 0) {
+            break;
+        }
+
+        /* Ensure null termination */
+        temp_buffer[bytes_read] = '\0';
+
+        /* Check if we have enough space */
+        if (total_bytes + bytes_read < buffer_size - 1) {
+            memcpy(output_buffer + total_bytes, temp_buffer, bytes_read);
+            total_bytes += bytes_read;
+        } else {
+            /* Buffer full, truncate */
+            break;
+        }
+    }
+
+    /* Null terminate output */
+    output_buffer[total_bytes] = '\0';
+
+    /* Wait for process to complete */
+    WaitForSingleObject(process_info.hProcess, INFINITE);
+
+    /* Get exit code */
+    DWORD dw_exit_code = 0;
+    if (exit_code != NULL) {
+        if (GetExitCodeProcess(process_info.hProcess, &dw_exit_code)) {
+            *exit_code = (int)dw_exit_code;
+        } else {
+            *exit_code = 1;
+        }
+    }
+
+    /* Cleanup */
+    CloseHandle(stdout_read);
+    CloseHandle(process_info.hProcess);
+    CloseHandle(process_info.hThread);
+
+    return true;
+}
+
+/**
+ * Execute DISM command with output processing for get-features command.
  *
  * @param command_line Full command line to execute.
  * @param is_get_features Whether this is a get-features command.
@@ -452,212 +554,91 @@ static int execute_dism_command(const char* command_line, bool is_get_features)
 
     /* Log the command being executed */
     printf("[DISM WRAPPER] Executing: %s\n", command_line);
-    if (is_get_features) {
-        printf("[DISM WRAPPER] Output will be intercepted and modified\n");
-    }
-    printf("\n");
-
-    STARTUPINFO startup_info;
-    PROCESS_INFORMATION process_info;
-    SECURITY_ATTRIBUTES security_attrs;
-
-    /* Initialize structures */
-    ZeroMemory(&startup_info, sizeof(startup_info));
-    startup_info.cb = sizeof(startup_info);
-    ZeroMemory(&process_info, sizeof(process_info));
-    ZeroMemory(&security_attrs, sizeof(security_attrs));
-
-    HANDLE stdout_read = NULL;
-    HANDLE stdout_write = NULL;
-    HANDLE stderr_read = NULL;
-    HANDLE stderr_write = NULL;
-
-    /* Set up security attributes for inheritable handles */
-    security_attrs.nLength = sizeof(SECURITY_ATTRIBUTES);
-    security_attrs.bInheritHandle = TRUE;
-    security_attrs.lpSecurityDescriptor = NULL;
-
-    if (is_get_features) {
-        /* Create pipes for stdout and stderr */
-        if (!CreatePipe(&stdout_read, &stdout_write, &security_attrs, 0)) {
-            fprintf(stderr, "ERROR: Failed to create stdout pipe\n");
-            return 1;
-        }
-
-        if (!CreatePipe(&stderr_read, &stderr_write, &security_attrs, 0)) {
-            fprintf(stderr, "ERROR: Failed to create stderr pipe\n");
-            CloseHandle(stdout_read);
-            CloseHandle(stdout_write);
-            return 1;
-        }
-
-        /* Ensure the read handles are not inherited */
-        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
-
-        /* Set up startup info with redirected output */
-        startup_info.dwFlags = STARTF_USESTDHANDLES;
-        startup_info.hStdOutput = stdout_write;
-        startup_info.hStdError = stderr_write;
-        startup_info.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    }
-
-    /* Create mutable copy of command line for CreateProcess */
-    char* mutable_cmdline = _strdup(command_line);
-    if (mutable_cmdline == NULL) {
-        fprintf(stderr, "ERROR: Memory allocation failed for command line\n");
-        if (is_get_features) {
-            CloseHandle(stdout_read);
-            CloseHandle(stdout_write);
-            CloseHandle(stderr_read);
-            CloseHandle(stderr_write);
-        }
-        return 1;
-    }
-
-    /* Create the process */
-    BOOL success = CreateProcess(
-        NULL,               /* No module name (use command line) */
-        mutable_cmdline,    /* Command line */
-        NULL,               /* Process handle not inheritable */
-        NULL,               /* Thread handle not inheritable */
-        is_get_features,    /* Inherit handles if redirecting output */
-        is_get_features ? CREATE_NO_WINDOW : 0, /* Creation flags */
-        NULL,               /* Use parent's environment block */
-        NULL,               /* Use parent's starting directory */
-        &startup_info,      /* Pointer to STARTUPINFO structure */
-        &process_info       /* Pointer to PROCESS_INFORMATION structure */
-    );
-
-    free(mutable_cmdline);
-
-    /* Close write ends of pipes so child process can exit */
-    if (is_get_features) {
-        CloseHandle(stdout_write);
-        CloseHandle(stderr_write);
-    }
-
-    if (!success) {
-        DWORD error_code = GetLastError();
-        fprintf(stderr, "ERROR: CreateProcess failed (Error %lu)\n", error_code);
-
-        if (is_get_features) {
-            CloseHandle(stdout_read);
-            CloseHandle(stderr_read);
-        }
-
-        return 1;
-    }
-
-    /* Handle output interception if needed */
-    if (is_get_features) {
-        /* Buffer for reading output */
-        char output_buffer[OUTPUT_BUFFER_SIZE];
-        DWORD bytes_read = 0;
-        BOOL read_result = FALSE;
-
-        /* Read and process stdout */
-        while (1) {
-            /* Check if process has finished */
-            DWORD wait_result = WaitForSingleObject(process_info.hProcess, 100);
-            if (wait_result == WAIT_OBJECT_0) {
-                /* Process has finished, read any remaining output */
-                do {
-                    read_result = ReadFile(stdout_read, output_buffer,
-                                         sizeof(output_buffer) - 1, &bytes_read, NULL);
-
-                    if (read_result && bytes_read > 0) {
-                        /* Process output chunk */
-                        char* processed = process_output_chunk(output_buffer, bytes_read);
-                        if (processed != NULL) {
-                            printf("%.*s", (int)strlen(processed), processed);
-                            fflush(stdout);
-                            free(processed);
-                        } else {
-                            /* If processing failed, output original */
-                            printf("%.*s", (int)bytes_read, output_buffer);
-                            fflush(stdout);
-                        }
-                    }
-                } while (read_result && bytes_read > 0);
-                break;
-            } else if (wait_result == WAIT_TIMEOUT) {
-                /* Process still running, try to read if data is available */
-                DWORD bytes_available = 0;
-                if (PeekNamedPipe(stdout_read, NULL, 0, NULL, &bytes_available, NULL) &&
-                    bytes_available > 0) {
-
-                    read_result = ReadFile(stdout_read, output_buffer,
-                                         sizeof(output_buffer) - 1, &bytes_read, NULL);
-
-                    if (read_result && bytes_read > 0) {
-                        /* Process output chunk */
-                        char* processed = process_output_chunk(output_buffer, bytes_read);
-                        if (processed != NULL) {
-                            printf("%.*s", (int)strlen(processed), processed);
-                            fflush(stdout);
-                            free(processed);
-                        } else {
-                            /* If processing failed, output original */
-                            printf("%.*s", (int)bytes_read, output_buffer);
-                            fflush(stdout);
-                        }
-                    }
-                }
-            } else {
-                /* Wait failed, break */
-                break;
-            }
-        }
-
-        /* Read and pass through stderr unchanged */
-        while (1) {
-            DWORD bytes_available = 0;
-            if (!PeekNamedPipe(stderr_read, NULL, 0, NULL, &bytes_available, NULL)) {
-                break;
-            }
-
-            if (bytes_available > 0) {
-                read_result = ReadFile(stderr_read, output_buffer,
-                                     sizeof(output_buffer) - 1, &bytes_read, NULL);
-
-                if (read_result && bytes_read > 0) {
-                    /* Output stderr unchanged */
-                    fwrite(output_buffer, 1, bytes_read, stderr);
-                    fflush(stderr);
-                }
-            } else {
-                /* No more data in stderr, check if process has finished */
-                if (WaitForSingleObject(process_info.hProcess, 100) == WAIT_OBJECT_0) {
-                    break;
-                }
-            }
-        }
-
-        /* Close pipe handles */
-        CloseHandle(stdout_read);
-        CloseHandle(stderr_read);
-    } else {
-        /* Not a get-features command, wait for process to complete */
-        WaitForSingleObject(process_info.hProcess, INFINITE);
-    }
-
-    /* Get the exit code */
-    DWORD exit_code = 0;
-    if (!GetExitCodeProcess(process_info.hProcess, &exit_code)) {
-        fprintf(stderr, "WARNING: Failed to get process exit code\n");
-        exit_code = 1;
-    }
-
-    /* Close process and thread handles */
-    CloseHandle(process_info.hProcess);
-    CloseHandle(process_info.hThread);
 
     if (!is_get_features) {
-        printf("\n[DISM WRAPPER] Process completed with exit code %lu\n", exit_code);
-    }
+        /* For non-get-features commands, execute directly */
+        STARTUPINFO startup_info;
+        PROCESS_INFORMATION process_info;
 
-    return (int)exit_code;
+        ZeroMemory(&startup_info, sizeof(startup_info));
+        startup_info.cb = sizeof(startup_info);
+        ZeroMemory(&process_info, sizeof(process_info));
+
+        char* mutable_cmdline = _strdup(command_line);
+        if (mutable_cmdline == NULL) {
+            fprintf(stderr, "ERROR: Memory allocation failed for command line\n");
+            return 1;
+        }
+
+        /* Create the process */
+        BOOL success = CreateProcess(
+            NULL,
+            mutable_cmdline,
+            NULL,
+            NULL,
+            FALSE,
+            0,
+            NULL,
+            NULL,
+            &startup_info,
+            &process_info
+        );
+
+        free(mutable_cmdline);
+
+        if (!success) {
+            DWORD error_code = GetLastError();
+            fprintf(stderr, "ERROR: CreateProcess failed (Error %lu)\n", error_code);
+            return 1;
+        }
+
+        /* Wait for process to complete */
+        WaitForSingleObject(process_info.hProcess, INFINITE);
+
+        /* Get exit code */
+        DWORD exit_code = 0;
+        if (!GetExitCodeProcess(process_info.hProcess, &exit_code)) {
+            fprintf(stderr, "WARNING: Failed to get process exit code\n");
+            exit_code = 1;
+        }
+
+        /* Cleanup */
+        CloseHandle(process_info.hProcess);
+        CloseHandle(process_info.hThread);
+
+        printf("[DISM WRAPPER] Process completed with exit code %lu\n", exit_code);
+        return (int)exit_code;
+    } else {
+        /* For get-features command, capture and process output */
+        printf("[DISM WRAPPER] Capturing and processing output...\n");
+
+        char output_buffer[OUTPUT_BUFFER_SIZE];
+        int exit_code = 0;
+
+        /* Execute command and capture output */
+        if (!execute_and_capture_output(command_line, output_buffer,
+                                      sizeof(output_buffer), &exit_code)) {
+            fprintf(stderr, "ERROR: Failed to execute command\n");
+            return 1;
+        }
+
+        /* Process output to replace feature name */
+        char* processed_output = string_replace(output_buffer,
+                                              OLD_FEATURE_NAME,
+                                              NEW_FEATURE_NAME);
+
+        if (processed_output != NULL) {
+            /* Output processed result */
+            printf("%s", processed_output);
+            free(processed_output);
+        } else {
+            /* If processing failed, output original */
+            printf("%s", output_buffer);
+        }
+
+        printf("[DISM WRAPPER] Command completed with exit code %d\n", exit_code);
+        return exit_code;
+    }
 }
 
 /* ============================================================================
@@ -673,7 +654,7 @@ static int execute_dism_command(const char* command_line, bool is_get_features)
  */
 int main(int argc, char* argv[])
 {
-    printf("[DISM WRAPPER] Version 2.1 - IIS Legacy SnapIn Interceptor\n");
+    printf("[DISM WRAPPER] Version 3.0 - IIS Legacy SnapIn Interceptor\n");
     printf("[DISM WRAPPER] Detected command: ");
     for (int i = 0; i < argc; i++) {
         printf("%s ", argv[i]);
